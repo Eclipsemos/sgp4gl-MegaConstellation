@@ -70,8 +70,9 @@ export const CesiumComponent: React.FC<{
 
   // ——— GPU propagator plumbing (kept minimal, mirrors CPU animate loop) ———
   const gpuPropagatorRef = React.useRef<typeof GpuPropagator | null>(null);
-  const registeredConstSetIdRef = React.useRef<number | null>(null);
+  const registeredConstSetIdsRef = React.useRef<number[]>([]);
   const wasmConstantsRef = React.useRef<(typeof WasmConstants)[] | null>(null);
+  const batchSizeRef = React.useRef<number>(65536); // Maximum batch size
 
   // Double buffers for streaming positions from GPU -> renderer
   const currentPositionsRef = React.useRef<PositionBuffer[]>([]);
@@ -115,13 +116,13 @@ export const CesiumComponent: React.FC<{
     viewer.clock.shouldAnimate = true;
 
     viewer.clock.startTime = CesiumJs.JulianDate.fromDate(
-      new Date("2024-04-14T00:00:00.000Z")
+      new Date("2026-01-04T00:00:00.000Z")  // 第4天
     );
     viewer.clock.stopTime = CesiumJs.JulianDate.fromDate(
-      new Date("2024-04-17T00:00:00.000Z")
+      new Date("2026-02-03T00:00:00.000Z")  // 第34天
     );
-    viewer.clock.currentTime = CesiumJs.JulianDate.clone(
-      viewer.clock.startTime
+    viewer.clock.currentTime = CesiumJs.JulianDate.fromDate(
+      new Date("2026-01-19T00:00:00.000Z")  // 从中间时间开始（第19天）
     );
     viewer.clock.multiplier = 300;
 
@@ -202,10 +203,24 @@ export const CesiumComponent: React.FC<{
       );
       wasmConstantsRef.current = constants;
 
-      // Register constants set on GPU (optimal batched path)
-      const gpuConsts = constants.map((c) => WasmGpuConsts.from_constants(c));
-      const constSetId = gpuPropagatorRef.current.register_const_set(gpuConsts);
-      registeredConstSetIdRef.current = constSetId;
+      // Register constants in batches to avoid exceeding GPU limits
+      const MAX_BATCH_SIZE = 65536;
+      const totalSats = constants.length;
+      const numBatches = Math.ceil(totalSats / MAX_BATCH_SIZE);
+      const constSetIds: number[] = [];
+
+      for (let batchIdx = 0; batchIdx < numBatches; batchIdx++) {
+        const startIdx = batchIdx * MAX_BATCH_SIZE;
+        const endIdx = Math.min(startIdx + MAX_BATCH_SIZE, totalSats);
+        const batchConstants = constants.slice(startIdx, endIdx);
+        
+        const gpuConsts = batchConstants.map((c) => WasmGpuConsts.from_constants(c));
+        const constSetId = gpuPropagatorRef.current.register_const_set(gpuConsts);
+        constSetIds.push(constSetId);
+      }
+      
+      registeredConstSetIdsRef.current = constSetIds;
+      batchSizeRef.current = MAX_BATCH_SIZE;
 
       // Create points & sat metadata arrays aligned by index (like CPU)
       parsed.forEach(({ tle }) => {
@@ -259,7 +274,7 @@ export const CesiumComponent: React.FC<{
 
         if (
           !gpuPropagatorRef.current ||
-          registeredConstSetIdRef.current === null
+          registeredConstSetIdsRef.current.length === 0
         )
           return;
         if (!metadata.length) return;
@@ -271,28 +286,42 @@ export const CesiumComponent: React.FC<{
 
         inflightRef.current++;
         try {
-          // Compute minutes since each TLE epoch
-          const times = new Float64Array(
-            metadata.map(
-              (m) =>
-                CesiumJs.JulianDate.secondsDifference(now, m.TLEEpochJulian) /
-                60.0
-            )
-          );
-
-          const flat = await gpuPropagatorRef.current.propagate_registered_f32(
-            registeredConstSetIdRef.current,
-            times
-          );
-
-          // Copy into target buffer (km -> m)
+          const MAX_BATCH_SIZE = batchSizeRef.current;
+          const totalSats = metadata.length;
           const tgt = targetPositionsRef.current;
-          const N = flat.length / 6; // [x y z vx vy vz]
-          for (let i = 0; i < N; i++) {
-            const o = i * 6;
-            tgt[i].x = flat[o] * 1000.0;
-            tgt[i].y = flat[o + 1] * 1000.0;
-            tgt[i].z = flat[o + 2] * 1000.0;
+          const constSetIds = registeredConstSetIdsRef.current;
+
+          // Process each registered batch
+          for (let batchIdx = 0; batchIdx < constSetIds.length; batchIdx++) {
+            const startIdx = batchIdx * MAX_BATCH_SIZE;
+            const endIdx = Math.min(startIdx + MAX_BATCH_SIZE, totalSats);
+            const batchSize = endIdx - startIdx;
+
+            // Compute times for this batch
+            const times = new Float64Array(batchSize);
+            for (let i = 0; i < batchSize; i++) {
+              const metaIdx = startIdx + i;
+              times[i] = CesiumJs.JulianDate.secondsDifference(
+                now,
+                metadata[metaIdx].TLEEpochJulian
+              ) / 60.0;
+            }
+
+            // Propagate this batch using its corresponding registered const set
+            const flat = await gpuPropagatorRef.current.propagate_registered_f32(
+              constSetIds[batchIdx],
+              times
+            );
+
+            // Copy into target buffer (km -> m) for this batch
+            const N = flat.length / 6; // [x y z vx vy vz]
+            for (let i = 0; i < N; i++) {
+              const targetIdx = startIdx + i;
+              const o = i * 6;
+              tgt[targetIdx].x = flat[o] * 1000.0;
+              tgt[targetIdx].y = flat[o + 1] * 1000.0;
+              tgt[targetIdx].z = flat[o + 2] * 1000.0;
+            }
           }
         } catch (e) {
           console.error("GPU propagate loop error", e);
@@ -386,18 +415,19 @@ export const CesiumComponent: React.FC<{
       try {
         if (
           gpuPropagatorRef.current &&
-          registeredConstSetIdRef.current !== null
+          registeredConstSetIdsRef.current.length > 0
         ) {
           const tryUnregister = () => {
             if (inflightRef.current === 0) {
               try {
-                gpuPropagatorRef.current!.unregister_const_set(
-                  registeredConstSetIdRef.current!
-                );
+                // Unregister all batched const sets
+                for (const constSetId of registeredConstSetIdsRef.current) {
+                  gpuPropagatorRef.current!.unregister_const_set(constSetId);
+                }
               } catch (e) {
                 console.error("unregister_const_set error", e);
               } finally {
-                registeredConstSetIdRef.current = null;
+                registeredConstSetIdsRef.current = [];
               }
             } else {
               setTimeout(tryUnregister, 10);

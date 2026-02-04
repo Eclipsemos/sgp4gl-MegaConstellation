@@ -271,7 +271,7 @@ export const PerformanceComparison: React.FunctionComponent<{
             fontSize: "11px",
           }}
         >
-          {getComponentDescription(selectedComponent)}
+          {/* {getComponentDescription(selectedComponent)} */}
         </div>
 
         {/* Performance Stats */}

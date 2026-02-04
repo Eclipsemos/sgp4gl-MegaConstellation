@@ -24,7 +24,7 @@ export const Home: NextPage<
 
   useEffect(() => {
     const fetchTLEs = async () => {
-      const res = await fetch("/tle_04_13_2024.txt");
+      const res = await fetch("/tles.txt");
       const tleData = await res.text();
 
       if (typeof tleData === "string" && tleData.length) {

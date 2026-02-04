@@ -71,13 +71,13 @@ export const CesiumComponent_CPU: React.FC<{
     viewer.clock.shouldAnimate = true;
 
     cesiumViewer.current.clock.startTime = CesiumJs.JulianDate.fromDate(
-      new Date("2024-04-14T00:00:00.000Z")
+      new Date("2026-01-04T00:00:00.000Z")  // Day 4 of 2026
     );
     cesiumViewer.current.clock.stopTime = CesiumJs.JulianDate.fromDate(
-      new Date("2024-04-17T00:00:00.000Z")
+      new Date("2026-02-03T00:00:00.000Z")  // Day 34 of 2026
     );
     cesiumViewer.current.clock.currentTime = CesiumJs.JulianDate.fromDate(
-      new Date("2024-04-14T00:00:00.000Z")
+      new Date("2026-01-19T00:00:00.000Z")  // Day 19 (middle of range)
     );
 
     viewer.clock.currentTime = CesiumJs.JulianDate.clone(
